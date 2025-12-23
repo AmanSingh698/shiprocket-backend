@@ -10,6 +10,7 @@ app.use(express.json());
 let shiprocketToken = null;
 let tokenExpiry = null;
 console.log("Email is : ", process.env.SHIPROCKET_EMAIL);
+console.log("Pwd is : ", process.env.SHIPROCKET_PASSWORD);
 
 // =======================
 // Shiprocket Login
