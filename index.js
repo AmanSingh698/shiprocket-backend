@@ -9,8 +9,8 @@ app.use(express.json());
 
 let shiprocketToken = null;
 let tokenExpiry = null;
-console.log("Email is : ", process.env.SHIPROCKET_EMAIL);
-console.log("Pwd is : ", process.env.SHIPROCKET_PASSWORD);
+// console.log("Email is : ", process.env.SHIPROCKET_EMAIL);
+// console.log("Pwd is : ", process.env.SHIPROCKET_PASSWORD);
 
 // =======================
 // Shiprocket Login
@@ -28,7 +28,7 @@ async function getShiprocketToken() {
     }
   );
 
-  console.log("Shiprocket login success", res.data);
+//   console.log("Shiprocket login success", res.data);
 
   shiprocketToken = res.data.token;
   tokenExpiry = Date.now() + 9 * 24 * 60 * 60 * 1000; // ~9 days
@@ -39,9 +39,9 @@ async function getShiprocketToken() {
 // =======================
 // Delivery Check API
 // =======================
-app.post("/test/check-delivery", async (req, res) => {
+app.post("/check-delivery", async (req, res) => {
   try {
-    console.log("Received request", req.body);
+    // console.log("Received request", req.body);
     const { pincode } = req.body;
 
     if (!pincode || !/^\d{6}$/.test(pincode)) {
@@ -49,7 +49,7 @@ app.post("/test/check-delivery", async (req, res) => {
     }
 
     const token = await getShiprocketToken();
-    console.log("Shiprocket token : ", token);
+    // console.log("Shiprocket token : ", token);
     
     const response = await axios.get(
       "https://apiv2.shiprocket.in/v1/external/courier/serviceability/",
@@ -67,7 +67,7 @@ app.post("/test/check-delivery", async (req, res) => {
         timeout: 8000
       }
     );
-    console.log("Shiprocket serviceability response", response.data);
+    // console.log("Shiprocket serviceability response", response.data);
     const courier =
       response.data?.data?.available_courier_companies?.[0];
 
