@@ -41,52 +41,13 @@ async function getShiprocketToken() {
   }
 }
 
-// Hyperlocal delivery pincodes (within 50km radius)
-const HYPERLOCAL_PINCODES = [
-  "110001",
-  "110002",
-  "110003",
-  "110004",
-  "110005",
-  "110006",
-  "110007",
-  "110008",
-  "110009",
-  "110010",
-  "110011",
-  "110012",
-  "110013",
-  "110014",
-  "110015",
-  "110077",
-  "110078",
-  "110071",
-  "110070",
-];
-
-// Pincode to coordinates mapping for Delhi
-const PINCODE_COORDINATES = {
-  110001: { lat: "28.6139", lng: "77.2090" }, // Connaught Place
-  110002: { lat: "28.6328", lng: "77.2197" }, // Darya Ganj
-  110003: { lat: "28.7041", lng: "77.1025" }, // Civil Lines
-  110004: { lat: "28.6517", lng: "77.2219" }, // Rashtrapati Bhavan
-  110005: { lat: "28.6436", lng: "77.2186" }, // Karol Bagh
-  110006: { lat: "28.6304", lng: "77.2177" }, // Rajinder Nagar
-  110007: { lat: "28.6455", lng: "77.2167" }, // Motia Khan
-  110008: { lat: "28.6341", lng: "77.2419" }, // Daryaganj
-  110009: { lat: "28.6219", lng: "77.2324" }, // Paharganj
-  110010: { lat: "28.6341", lng: "77.2419" }, // Jhandewalan
-  110011: { lat: "28.6219", lng: "77.2324" }, // NDSE Part 1
-  110012: { lat: "28.5729", lng: "77.2545" }, // Lajpat Nagar
-  110013: { lat: "28.6341", lng: "77.2419" }, // Jama Masjid
-  110014: { lat: "28.5985", lng: "77.2386" }, // Nizamuddin
-  110015: { lat: "28.5355", lng: "77.2499" }, // Kalkaji
-  110077: { lat: "28.4595", lng: "77.0266" }, // Saket
-  110078: { lat: "28.5355", lng: "77.2499" }, // Nehru Place
-  110071: { lat: "28.5355", lng: "77.2499" }, // Panchsheel Park
-  110070: { lat: "28.5355", lng: "77.2499" }, // Sheikh Sarai
-};
-
+// Optional: Hyperlocal delivery pincodes whitelist (leave empty to check all pincodes dynamically)
+// If you want to restrict delivery to specific pincodes, add them here
+// Leave empty array [] to allow Shiprocket API to determine serviceability for any pincode
+const HYPERLOCAL_PINCODES = process.env.HYPERLOCAL_PINCODES 
+  ? process.env.HYPERLOCAL_PINCODES.split(',').map(p => p.trim())
+  : []; // Empty by default - fully dynamic
+console.log("HYPERLOCAL_PINCODES", HYPERLOCAL_PINCODES);
 // Your warehouse/pickup location coordinates
 const PICKUP_LOCATION = {
   pincode: "110077",
@@ -94,17 +55,130 @@ const PICKUP_LOCATION = {
   lng: "77.0266",
 };
 
+// Cache for pincode coordinates to avoid repeated API calls
+const pincodeCache = {};
+
 // =======================
-// Get coordinates for pincode
+// Get coordinates for pincode using geocoding API
 // =======================
-function getCoordinatesForPincode(pincode) {
-  // Return known coordinates or default Delhi center
-  return (
-    PINCODE_COORDINATES[pincode] || {
-      lat: "28.6139",
-      lng: "77.2090",
+async function getCoordinatesForPincode(pincode) {
+  // Check cache first
+  if (pincodeCache[pincode]) {
+    console.log(`📦 Using cached coordinates for pincode: ${pincode}`);
+    return pincodeCache[pincode];
+  }
+
+  // Use geocoding API to get coordinates dynamically
+  try {
+    console.log(`🔍 Fetching coordinates for pincode: ${pincode} from geocoding API`);
+    
+    // Using Nominatim (OpenStreetMap) - free geocoding service
+    // Format: pincode, India
+    const response = await axios.get(
+      "https://nominatim.openstreetmap.org/search",
+      {
+        params: {
+          q: `${pincode}, India`,
+          format: "json",
+          limit: 1,
+          addressdetails: 1,
+        },
+        headers: {
+          "User-Agent": "Shiprocket-Backend/1.0", // Required by Nominatim
+        },
+        timeout: 5000, // 5 second timeout
+      }
+    );
+
+    if (response.data && response.data.length > 0) {
+      const result = response.data[0];
+      const coordinates = {
+        lat: parseFloat(result.lat).toFixed(6),
+        lng: parseFloat(result.lon).toFixed(6),
+      };
+
+      // Cache the result
+      pincodeCache[pincode] = coordinates;
+      console.log(`✅ Found coordinates for ${pincode}: ${coordinates.lat}, ${coordinates.lng}`);
+      return coordinates;
     }
-  );
+
+    // Fallback: Try alternative geocoding API (India Post API or similar)
+    console.log(`⚠️ Nominatim didn't find results, trying alternative API...`);
+    return await getCoordinatesFromAlternativeAPI(pincode);
+  } catch (error) {
+    console.error(`❌ Geocoding error for pincode ${pincode}:`, error.message);
+    
+    // Fallback to alternative API
+    try {
+      return await getCoordinatesFromAlternativeAPI(pincode);
+    } catch (fallbackError) {
+      console.error(`❌ All geocoding APIs failed for pincode ${pincode}`);
+      // Last resort: return default Delhi center coordinates
+      const defaultCoords = {
+        lat: "28.6139",
+        lng: "77.2090",
+      };
+      pincodeCache[pincode] = defaultCoords;
+      return defaultCoords;
+    }
+  }
+}
+
+// Alternative geocoding API fallback
+async function getCoordinatesFromAlternativeAPI(pincode) {
+  try {
+    // Using Postalpincode.in API (free, India-specific)
+    const response = await axios.get(
+      `https://api.postalpincode.in/pincode/${pincode}`,
+      {
+        timeout: 5000,
+      }
+    );
+
+    if (
+      response.data &&
+      response.data[0] &&
+      response.data[0].PostOffice &&
+      response.data[0].PostOffice.length > 0
+    ) {
+      const postOffice = response.data[0].PostOffice[0];
+      const state = postOffice.State;
+      const district = postOffice.District;
+
+      // Use Nominatim again with more specific location
+      const detailedResponse = await axios.get(
+        "https://nominatim.openstreetmap.org/search",
+        {
+          params: {
+            q: `${pincode}, ${district}, ${state}, India`,
+            format: "json",
+            limit: 1,
+          },
+          headers: {
+            "User-Agent": "Shiprocket-Backend/1.0",
+          },
+          timeout: 5000,
+        }
+      );
+
+      if (detailedResponse.data && detailedResponse.data.length > 0) {
+        const result = detailedResponse.data[0];
+        const coordinates = {
+          lat: parseFloat(result.lat).toFixed(6),
+          lng: parseFloat(result.lon).toFixed(6),
+        };
+        pincodeCache[pincode] = coordinates;
+        console.log(`✅ Found coordinates via alternative API: ${coordinates.lat}, ${coordinates.lng}`);
+        return coordinates;
+      }
+    }
+  } catch (error) {
+    console.error(`❌ Alternative API error:`, error.message);
+    throw error;
+  }
+
+  throw new Error("No coordinates found");
 }
 
 // =======================
@@ -117,11 +191,13 @@ async function checkHyperlocalServiceability(
   deliveryLng
 ) {
   try {
-    // If coordinates not provided, get from pincode mapping
-    const deliveryCoords =
-      deliveryLat && deliveryLng
-        ? { lat: deliveryLat, lng: deliveryLng }
-        : getCoordinatesForPincode(pincode);
+    // If coordinates not provided, get from pincode geocoding
+    let deliveryCoords;
+    if (deliveryLat && deliveryLng) {
+      deliveryCoords = { lat: deliveryLat, lng: deliveryLng };
+    } else {
+      deliveryCoords = await getCoordinatesForPincode(pincode);
+    }
 
     console.log(`🔍 Checking serviceability for pincode: ${pincode}`);
     console.log(`📍 Pickup: ${PICKUP_LOCATION.lat}, ${PICKUP_LOCATION.lng}`);
@@ -178,8 +254,9 @@ app.post("/check-delivery", async (req, res) => {
       });
     }
 
-    // Check if pincode is in hyperlocal list
-    if (!HYPERLOCAL_PINCODES.includes(pincode)) {
+    // Optional: Check if pincode is in whitelist (only if HYPERLOCAL_PINCODES is configured)
+    // If HYPERLOCAL_PINCODES is empty, skip this check and let Shiprocket API determine serviceability
+    if (HYPERLOCAL_PINCODES.length > 0 && !HYPERLOCAL_PINCODES.includes(pincode)) {
       return res.json({
         success: false,
         message:
@@ -198,12 +275,10 @@ app.post("/check-delivery", async (req, res) => {
       lng
     );
 
-    if (
-      !serviceabilityData ||
-      serviceabilityData.status !== 200 ||
-      !serviceabilityData.data ||
-      !serviceabilityData.data.available_courier_companies
-    ) {
+    // Handle different response formats from Shiprocket API
+    let couriers = [];
+    
+    if (!serviceabilityData) {
       return res.json({
         success: false,
         message: "Delivery not available for this pincode",
@@ -211,24 +286,59 @@ app.post("/check-delivery", async (req, res) => {
       });
     }
 
-    const couriers = serviceabilityData.data.available_courier_companies;
+    // Check for Shiprocket Quick API format (status: true, data: array)
+    if (serviceabilityData.status === true && Array.isArray(serviceabilityData.data)) {
+      couriers = serviceabilityData.data.map(courier => ({
+        courier_name: courier.courier_name,
+        courier_company_id: courier.courier_company_id || courier.courier_id,
+        freight_charge: courier.rates || courier.freight_charge || courier.rate,
+        rate: courier.rates || courier.rate,
+        etd: courier.etd,
+        etd_hours: courier.etd_hours,
+        distance: courier.distance,
+        rto_rates: courier.rto_rates,
+      }));
+    }
+    // Check for standard Shiprocket API format (status: 200, data.available_courier_companies)
+    else if (
+      serviceabilityData.status === 200 &&
+      serviceabilityData.data &&
+      Array.isArray(serviceabilityData.data.available_courier_companies)
+    ) {
+      couriers = serviceabilityData.data.available_courier_companies;
+    }
+    // Fallback: try to extract couriers from data if it's an array
+    else if (Array.isArray(serviceabilityData.data)) {
+      couriers = serviceabilityData.data;
+    }
+    // Fallback: check if couriers are directly in the response
+    else if (Array.isArray(serviceabilityData.available_courier_companies)) {
+      couriers = serviceabilityData.available_courier_companies;
+    }
 
-    if (couriers.length === 0) {
+    // If no couriers found, return error
+    if (!couriers || couriers.length === 0) {
       return res.json({
         success: false,
-        message: "No courier available for delivery to this pincode",
+        message: "Delivery not available for this pincode",
+        debug_info: {
+          message: "No couriers found in response",
+          response_structure: serviceabilityData,
+        },
       });
     }
 
     console.log(`📦 Found ${couriers.length} available couriers`);
+    console.log(`📋 Couriers:`, JSON.stringify(couriers, null, 2));
 
     // Filter for hyperlocal/quick delivery couriers
     const quickCouriers = couriers.filter((courier) => {
       const name = courier.courier_name?.toLowerCase() || "";
       const etdHours = courier.etd_hours || 999;
 
-      // Known hyperlocal providers
+      // Known hyperlocal providers (including Shiprocket Quick)
       const isHyperlocalProvider =
+        name.includes("quick") ||
         name.includes("shadowfax") ||
         name.includes("dunzo") ||
         name.includes("borzo") ||
@@ -293,15 +403,20 @@ app.post("/check-delivery", async (req, res) => {
       success: true,
       delivery_time: deliveryTime,
       delivery_charge:
-        selectedCourier.freight_charge || selectedCourier.rate || 49,
+        selectedCourier.freight_charge || 
+        selectedCourier.rate || 
+        selectedCourier.rates || 
+        49,
       courier_name: selectedCourier.courier_name,
-      courier_id: selectedCourier.courier_company_id,
+      courier_id: selectedCourier.courier_company_id || selectedCourier.courier_id,
       etd: etdText,
       is_hyperlocal: isHyperlocal,
       service_type: serviceType,
       etd_hours: etdHours,
       total_couriers_available: couriers.length,
       hyperlocal_couriers_available: quickCouriers.length,
+      distance: selectedCourier.distance,
+      rto_rates: selectedCourier.rto_rates,
     });
   } catch (error) {
     console.error(
@@ -462,18 +577,101 @@ app.get("/track-order/:shipment_id", async (req, res) => {
 });
 
 // =======================
+// Get All Delivery Addresses and Courier Options (Hyperlocal)
+// =======================
+app.get("/get-delivery-addresses", async (req, res) => {
+  try {
+    const { page = 1, per_page = 30 } = req.query;
+    
+    // Get Shiprocket token
+    const token = await getShiprocketToken();
+
+    console.log(`🔍 Fetching delivery addresses (page: ${page}, per_page: ${per_page})`);
+
+    // Call Shiprocket hyperlocal delivery address API
+    // Note: This endpoint uses .co domain (not .in)
+    const response = await axios.get(
+      "https://apiv2.shiprocket.co/v1/hyperlocal/deliveryaddress/getalldeliveryaddress",
+      {
+        params: {
+          page: parseInt(page),
+          per_page: parseInt(per_page),
+          is_web: 1,
+          is_hyperlocal: 1,
+        },
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    console.log(`✅ Successfully fetched delivery addresses`);
+
+    res.json({
+      success: true,
+      data: response.data,
+      delivery_addresses: response.data?.data || response.data,
+      pagination: {
+        page: parseInt(page),
+        per_page: parseInt(per_page),
+      },
+    });
+  } catch (error) {
+    console.error(
+      "❌ Error fetching delivery addresses:",
+      error.response?.data || error.message
+    );
+
+    if (error.response?.status === 401) {
+      shiprocketToken = null;
+      tokenExpiry = null;
+      return res.status(401).json({
+        success: false,
+        message: "Authentication failed. Please try again.",
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch delivery addresses",
+      error: error.response?.data || error.message,
+    });
+  }
+});
+
+// =======================
 // Get Pincode Coordinates (Helper endpoint)
 // =======================
-app.get("/get-coordinates/:pincode", (req, res) => {
-  const { pincode } = req.params;
-  const coords = getCoordinatesForPincode(pincode);
+app.get("/get-coordinates/:pincode", async (req, res) => {
+  try {
+    const { pincode } = req.params;
+    
+    // Validate pincode format
+    if (!/^\d{6}$/.test(pincode)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid pincode format. Please enter a 6-digit pincode.",
+      });
+    }
 
-  res.json({
-    success: true,
-    pincode,
-    coordinates: coords,
-    is_mapped: !!PINCODE_COORDINATES[pincode],
-  });
+    const coords = await getCoordinatesForPincode(pincode);
+
+    res.json({
+      success: true,
+      pincode,
+      coordinates: coords,
+      is_cached: !!pincodeCache[pincode],
+      source: pincodeCache[pincode] ? "cache" : "geocoding_api",
+    });
+  } catch (error) {
+    console.error(`❌ Error getting coordinates for ${req.params.pincode}:`, error.message);
+    res.status(500).json({
+      success: false,
+      message: "Failed to get coordinates for pincode",
+      error: error.message,
+    });
+  }
 });
 
 // Health check endpoint
@@ -482,7 +680,9 @@ app.get("/health", (req, res) => {
     status: "ok",
     timestamp: new Date().toISOString(),
     pickup_location: PICKUP_LOCATION,
-    hyperlocal_pincodes: HYPERLOCAL_PINCODES.length,
+    hyperlocal_pincodes_whitelist_enabled: HYPERLOCAL_PINCODES.length > 0,
+    hyperlocal_pincodes_count: HYPERLOCAL_PINCODES.length,
+    coordinates_source: "dynamic_geocoding_api",
   });
 });
 
@@ -493,5 +693,10 @@ app.listen(PORT, () => {
   console.log(
     `📍 Pickup location: ${PICKUP_LOCATION.pincode} (${PICKUP_LOCATION.lat}, ${PICKUP_LOCATION.lng})`
   );
-  console.log(`🏙️  Serving ${HYPERLOCAL_PINCODES.length} hyperlocal pincodes`);
+  if (HYPERLOCAL_PINCODES.length > 0) {
+    console.log(`🏙️  Pincode whitelist enabled: ${HYPERLOCAL_PINCODES.length} pincodes`);
+  } else {
+    console.log(`🌍 Fully dynamic mode: All pincodes checked via Shiprocket API`);
+  }
+  console.log(`📍 Coordinates: Dynamic geocoding (no hardcoded mappings)`);
 });
