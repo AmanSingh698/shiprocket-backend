@@ -47,7 +47,16 @@ async function getShiprocketToken() {
 const HYPERLOCAL_PINCODES = process.env.HYPERLOCAL_PINCODES 
   ? process.env.HYPERLOCAL_PINCODES.split(',').map(p => p.trim())
   : []; // Empty by default - fully dynamic
-console.log("HYPERLOCAL_PINCODES", HYPERLOCAL_PINCODES);
+
+// Product IDs that are available for LOCAL DELIVERY ONLY
+// Products in this array will ONLY use hyperlocal delivery (no fallback to legacy)
+// Products NOT in this array can use both hyperlocal (if pincode is local) and legacy (for pan-India)
+const LOCAL_ONLY_PRODUCTS = process.env.LOCAL_ONLY_PRODUCTS
+  ? process.env.LOCAL_ONLY_PRODUCTS.split(',').map(id => id.trim())
+  : []; // Add product IDs here, e.g., ["123456", "789012"]
+
+console.log("HYPERLOCAL_PINCODES:", HYPERLOCAL_PINCODES.length > 0 ? HYPERLOCAL_PINCODES : "All pincodes (dynamic)");
+console.log("LOCAL_ONLY_PRODUCTS:", LOCAL_ONLY_PRODUCTS.length > 0 ? LOCAL_ONLY_PRODUCTS : "None (all products are pan-India)");
 // Your warehouse/pickup location coordinates
 const PICKUP_LOCATION = {
   pincode: "110077",
@@ -240,11 +249,51 @@ async function checkHyperlocalServiceability(
 }
 
 // =======================
+// Check Legacy Courier Serviceability (Pan-India)
+// =======================
+async function checkLegacyCourierServiceability(
+  pincode,
+  token,
+  weight = 0.5,
+  cod = 0
+) {
+  try {
+    console.log(`🔍 Checking legacy courier serviceability for pincode: ${pincode}`);
+
+    const response = await axios.get(
+      "https://apiv2.shiprocket.in/v1/external/courier/serviceability/",
+      {
+        params: {
+          pickup_postcode: PICKUP_LOCATION.pincode,
+          delivery_postcode: pincode,
+          weight: weight, // Weight in kg
+          cod: cod, // 0 for prepaid, 1 for COD
+          // Note: No is_new_hyperlocal parameter = standard courier service
+        },
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    console.log(`✅ Legacy courier serviceability check successful for ${pincode}`);
+    return response.data;
+  } catch (error) {
+    console.error(
+      "❌ Legacy courier serviceability check error:",
+      error.response?.data || error.message
+    );
+    return null;
+  }
+}
+
+// =======================
 // Delivery Check API (UPDATED)
 // =======================
 app.post("/check-delivery", async (req, res) => {
   try {
-    const { pincode, lat, lng, weight, cod } = req.body;
+    const { pincode, lat, lng, weight, cod, product_id } = req.body;
 
     // Validate pincode format
     if (!pincode || !/^\d{6}$/.test(pincode)) {
@@ -254,77 +303,126 @@ app.post("/check-delivery", async (req, res) => {
       });
     }
 
-    // Optional: Check if pincode is in whitelist (only if HYPERLOCAL_PINCODES is configured)
-    // If HYPERLOCAL_PINCODES is empty, skip this check and let Shiprocket API determine serviceability
-    if (HYPERLOCAL_PINCODES.length > 0 && !HYPERLOCAL_PINCODES.includes(pincode)) {
-      return res.json({
-        success: false,
-        message:
-          "We don't deliver here. To place order, message us on 1234567890",
-      });
-    }
-
     // Get Shiprocket token
     const token = await getShiprocketToken();
+    const productWeight = weight || 0.5;
+    const productCod = cod || 0;
 
-    // Check serviceability with coordinates
-    const serviceabilityData = await checkHyperlocalServiceability(
-      pincode,
-      token,
-      lat,
-      lng
-    );
-
-    // Handle different response formats from Shiprocket API
-    let couriers = [];
+    // Determine if product is local-only
+    const isLocalOnlyProduct = product_id && LOCAL_ONLY_PRODUCTS.includes(String(product_id));
     
-    if (!serviceabilityData) {
+    // Determine if pincode is in local delivery area
+    // If HYPERLOCAL_PINCODES is empty, we'll check via API (assume all pincodes can be local)
+    const isLocalPincode = HYPERLOCAL_PINCODES.length === 0 || HYPERLOCAL_PINCODES.includes(pincode);
+
+    console.log(`📦 Product ID: ${product_id || "N/A"}`);
+    console.log(`📍 Pincode: ${pincode}`);
+    console.log(`🏠 Is Local-Only Product: ${isLocalOnlyProduct}`);
+    console.log(`📍 Is Local Pincode: ${isLocalPincode}`);
+
+    // Logic:
+    // 1. If product is local-only AND pincode is local → Use hyperlocal API
+    // 2. If product is local-only AND pincode is NOT local → Return error (no delivery)
+    // 3. If product is pan-India AND pincode is local → Use hyperlocal API
+    // 4. If product is pan-India AND pincode is NOT local → Use legacy API
+
+    let serviceabilityData = null;
+    let deliveryMethod = "hyperlocal";
+    let couriers = [];
+
+    // Helper function to extract couriers from response
+    function extractCouriers(data) {
+      let couriers = [];
+      
+      // Check for Shiprocket Quick API format (status: true, data: array)
+      if (data.status === true && Array.isArray(data.data)) {
+        couriers = data.data.map(courier => ({
+          courier_name: courier.courier_name,
+          courier_company_id: courier.courier_company_id || courier.courier_id,
+          freight_charge: courier.rates || courier.freight_charge || courier.rate,
+          rate: courier.rates || courier.rate,
+          etd: courier.etd,
+          etd_hours: courier.etd_hours,
+          distance: courier.distance,
+          rto_rates: courier.rto_rates,
+        }));
+      }
+      // Check for standard Shiprocket API format (status: 200, data.available_courier_companies)
+      else if (
+        data.status === 200 &&
+        data.data &&
+        Array.isArray(data.data.available_courier_companies)
+      ) {
+        couriers = data.data.available_courier_companies;
+      }
+      // Fallback: try to extract couriers from data if it's an array
+      else if (Array.isArray(data.data)) {
+        couriers = data.data;
+      }
+      // Fallback: check if couriers are directly in the response
+      else if (Array.isArray(data.available_courier_companies)) {
+        couriers = data.available_courier_companies;
+      }
+      
+      return couriers;
+    }
+
+    // Case 1 & 3: Use hyperlocal API (local-only product with local pincode OR pan-India product with local pincode)
+    if (isLocalPincode) {
+      console.log(`⚡ Using hyperlocal API for local pincode`);
+      serviceabilityData = await checkHyperlocalServiceability(
+        pincode,
+        token,
+        lat,
+        lng
+      );
+
+      if (serviceabilityData) {
+        couriers = extractCouriers(serviceabilityData);
+        console.log(`✅ Found ${couriers.length} hyperlocal couriers`);
+      }
+    }
+
+    // Case 2: Local-only product but pincode is not local → Return error
+    if (isLocalOnlyProduct && !isLocalPincode) {
       return res.json({
         success: false,
-        message: "Delivery not available for this pincode",
-        debug_info: serviceabilityData,
+        message: "This product is only available for local delivery. We don't deliver to this pincode.",
+        product_id: product_id,
+        is_local_only: true,
       });
     }
 
-    // Check for Shiprocket Quick API format (status: true, data: array)
-    if (serviceabilityData.status === true && Array.isArray(serviceabilityData.data)) {
-      couriers = serviceabilityData.data.map(courier => ({
-        courier_name: courier.courier_name,
-        courier_company_id: courier.courier_company_id || courier.courier_id,
-        freight_charge: courier.rates || courier.freight_charge || courier.rate,
-        rate: courier.rates || courier.rate,
-        etd: courier.etd,
-        etd_hours: courier.etd_hours,
-        distance: courier.distance,
-        rto_rates: courier.rto_rates,
-      }));
-    }
-    // Check for standard Shiprocket API format (status: 200, data.available_courier_companies)
-    else if (
-      serviceabilityData.status === 200 &&
-      serviceabilityData.data &&
-      Array.isArray(serviceabilityData.data.available_courier_companies)
-    ) {
-      couriers = serviceabilityData.data.available_courier_companies;
-    }
-    // Fallback: try to extract couriers from data if it's an array
-    else if (Array.isArray(serviceabilityData.data)) {
-      couriers = serviceabilityData.data;
-    }
-    // Fallback: check if couriers are directly in the response
-    else if (Array.isArray(serviceabilityData.available_courier_companies)) {
-      couriers = serviceabilityData.available_courier_companies;
+    // Case 4: Pan-India product but pincode is not local → Use legacy API
+    if (!isLocalOnlyProduct && !isLocalPincode) {
+      console.log(`📦 Using legacy courier API for pan-India delivery`);
+      deliveryMethod = "legacy";
+      
+      serviceabilityData = await checkLegacyCourierServiceability(
+        pincode,
+        token,
+        productWeight,
+        productCod
+      );
+
+      if (serviceabilityData) {
+        couriers = extractCouriers(serviceabilityData);
+        console.log(`✅ Found ${couriers.length} legacy couriers`);
+      }
     }
 
     // If no couriers found, return error
     if (!couriers || couriers.length === 0) {
+      const errorMessage = isLocalOnlyProduct
+        ? "This product is only available for local delivery. Delivery not available for this pincode."
+        : "Delivery not available for this pincode";
+      
       return res.json({
         success: false,
-        message: "Delivery not available for this pincode",
-        debug_info: {
-          message: "No couriers found in response",
-          response_structure: serviceabilityData,
-        },
+        message: errorMessage,
+        product_id: product_id,
+        is_local_only: isLocalOnlyProduct,
+        delivery_method: deliveryMethod,
       });
     }
 
@@ -417,6 +515,9 @@ app.post("/check-delivery", async (req, res) => {
       hyperlocal_couriers_available: quickCouriers.length,
       distance: selectedCourier.distance,
       rto_rates: selectedCourier.rto_rates,
+      delivery_method: deliveryMethod, // "hyperlocal" or "legacy"
+      product_id: product_id,
+      is_local_only_product: isLocalOnlyProduct,
     });
   } catch (error) {
     console.error(
